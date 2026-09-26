@@ -260,6 +260,101 @@ textarea:focus {
   font-size: 13px;
 }
 
+/* ---------- 参考演奏对照 ---------- */
+
+.compare-sides {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 20px;
+}
+
+@media (max-width: 640px) {
+  .compare-sides {
+    grid-template-columns: 1fr;
+  }
+}
+
+.side-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.side-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.compare-note {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.diff-detail {
+  margin-top: 8px;
+  border-top: 1px dashed rgba(0, 0, 0, 0.14);
+  padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 14px;
+}
+
+.diff-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.diff-row {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.diff-row .label {
+  color: var(--muted);
+}
+
+.diff-row .value {
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-weight: 600;
+}
+
+.diff-row .mixed {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.diff-row code {
+  background: rgba(0, 0, 0, 0.06);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.state {
+  font-size: 12px;
+  border-radius: 999px;
+  padding: 2px 9px;
+  font-weight: 600;
+}
+
+.state-sounding {
+  color: var(--ok);
+  background: rgba(23, 128, 61, 0.12);
+}
+
+.state-silent {
+  color: var(--muted);
+  background: rgba(0, 0, 0, 0.08);
+}
+
 .docs {
   margin-top: 16px;
 }

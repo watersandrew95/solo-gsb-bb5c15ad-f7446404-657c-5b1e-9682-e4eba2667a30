@@ -40,6 +40,8 @@ export interface MeasureInput {
 export interface ScoreInput {
   timeSignature: TimeSignature;
   measures: MeasureInput[];
+  /** 可选：参考演奏，小节数须与 measures 相同，事件结构同 measures */
+  referenceMeasures?: MeasureInput[];
 }
 
 /* ---------- 校验 ---------- */
@@ -92,20 +94,42 @@ export function validateScore(input: unknown): AnalysisError[] {
   if (!Array.isArray(measures) || measures.length === 0) {
     errors.push({ path: 'measures', message: '必须是非空数组，每个元素为一个小节' });
   } else {
-    measures.forEach((m, mi) => {
-      const mPath = `measures[${mi}]`;
-      if (!isRecord(m) || !Array.isArray(m.events)) {
-        errors.push({ path: mPath, message: '每个小节必须是含 events 数组的对象' });
-        return;
+    validateMeasureList(measures, 'measures', errors);
+  }
+
+  const reference = input.referenceMeasures;
+  if (reference !== undefined) {
+    if (!Array.isArray(reference) || reference.length === 0) {
+      errors.push({
+        path: 'referenceMeasures',
+        message: '必须是非空数组，每个元素为一个小节；不需要对照时请整体省略该字段',
+      });
+    } else {
+      validateMeasureList(reference, 'referenceMeasures', errors);
+      if (Array.isArray(measures) && reference.length !== measures.length) {
+        errors.push({
+          path: 'referenceMeasures',
+          message: `小节数须与 measures 相同（referenceMeasures 为 ${reference.length} 个，measures 为 ${measures.length} 个）`,
+        });
       }
-      if (m.events.length === 0) {
-        errors.push({ path: `${mPath}.events`, message: '小节至少包含一个事件' });
-      }
-      m.events.forEach((e, ei) => validateEvent(e, `${mPath}.events[${ei}]`, 0, errors));
-    });
+    }
   }
 
   return errors;
+}
+
+function validateMeasureList(list: unknown[], basePath: string, errors: AnalysisError[]): void {
+  list.forEach((m, mi) => {
+    const mPath = `${basePath}[${mi}]`;
+    if (!isRecord(m) || !Array.isArray(m.events)) {
+      errors.push({ path: mPath, message: '每个小节必须是含 events 数组的对象' });
+      return;
+    }
+    if (m.events.length === 0) {
+      errors.push({ path: `${mPath}.events`, message: '小节至少包含一个事件' });
+    }
+    m.events.forEach((e, ei) => validateEvent(e, `${mPath}.events[${ei}]`, 0, errors));
+  });
 }
 
 function validateEvent(node: unknown, path: string, depth: number, errors: AnalysisError[]): void {
@@ -212,11 +236,12 @@ function findFirstOverflow(
   return { overflowPath: null, acc };
 }
 
-/** 逐小节分析。调用前须保证 validateScore 无错误。 */
-export function analyze(score: ScoreInput): MeasureReport[] {
-  const expected = Frac.of(score.timeSignature.numerator, score.timeSignature.denominator);
-
-  return score.measures.map((m, mi) => {
+function analyzeMeasures(
+  measures: MeasureInput[],
+  expected: Frac,
+  basePath: string,
+): MeasureReport[] {
+  return measures.map((m, mi) => {
     const actual = m.events.reduce<Frac>((acc, e) => acc.add(eventDuration(e)), Frac.zero());
     const diff = actual.sub(expected);
     const sign = diff.sign();
@@ -229,10 +254,165 @@ export function analyze(score: ScoreInput): MeasureReport[] {
         expected,
         Frac.zero(),
         Frac.of(1),
-        `measures[${mi}].events`,
+        `${basePath}[${mi}].events`,
       ).overflowPath;
     }
 
     return { index: mi + 1, expected, actual, diff, status, overflowPath };
   });
+}
+
+/* ---------- 演奏轮廓对照 ---------- */
+
+/** 展开后的时间段：音符为发声、休止符为静音 */
+export interface Segment {
+  /** 段起点（以全音符为 1，从小节起点计） */
+  start: Frac;
+  /** 段终点（不含） */
+  end: Frac;
+  /** true = 发声（音符），false = 静音（休止符） */
+  sounding: boolean;
+  /** 产生该段的叶事件树路径 */
+  path: string;
+}
+
+/**
+ * 将一个小节的事件树按演奏顺序展开为精确分数时间段。
+ * 嵌套连音按沿途倍率（inTimeOf/actual 的乘积）缩放叶事件时值。
+ * 调用前须保证 validateScore 无错误。
+ */
+export function expandMeasure(events: RhythmEvent[], basePath: string): Segment[] {
+  const segments: Segment[] = [];
+
+  const walk = (list: RhythmEvent[], start: Frac, scale: Frac, path: string): Frac => {
+    let acc = start;
+    list.forEach((e, i) => {
+      const p = `${path}[${i}]`;
+      if (e.type === 'tuplet') {
+        acc = walk(e.events, acc, scale.mul(Frac.of(e.inTimeOf, e.actual)), `${p}.events`);
+      } else {
+        const end = acc.add(leafDuration(e).mul(scale));
+        segments.push({ start: acc, end, sounding: e.type === 'note', path: p });
+        acc = end;
+      }
+    });
+    return acc;
+  };
+
+  walk(events, Frac.zero(), Frac.of(1), basePath);
+  return segments;
+}
+
+/** 合并相邻（首尾相接）且状态相同的片段，忽略等价的事件拆分 */
+function mergeSegments(segments: Segment[]): Segment[] {
+  const merged: Segment[] = [];
+  for (const s of segments) {
+    const last = merged[merged.length - 1];
+    if (last && last.sounding === s.sounding && last.end.cmp(s.start) === 0) {
+      merged[merged.length - 1] = { ...last, end: s.end };
+    } else {
+      merged.push({ ...s });
+    }
+  }
+  return merged;
+}
+
+/** 覆盖时刻 t 的原始（未合并）叶事件树路径 */
+function pathAt(segments: Segment[], t: Frac): string {
+  for (const s of segments) {
+    if (s.start.cmp(t) <= 0 && t.cmp(s.end) < 0) return s.path;
+  }
+  // 片段连续覆盖整小节，理论上不会到达；兜底取最后一段
+  return segments.length > 0 ? segments[segments.length - 1].path : '';
+}
+
+export type SegmentState = 'sounding' | 'silent';
+
+export interface OutlineDiff {
+  /** 最早差异区间起点（含） */
+  start: Frac;
+  /** 最早差异区间终点（不含） */
+  end: Frac;
+  scoreState: SegmentState;
+  referenceState: SegmentState;
+  /** 差异区间起点处，记谱侧的原事件树路径 */
+  scorePath: string;
+  /** 差异区间起点处，参考侧的原事件树路径 */
+  referencePath: string;
+}
+
+export type OutlineComparison = { kind: 'match' } | { kind: 'diff'; diff: OutlineDiff };
+
+/**
+ * 比较两侧（均已展开的小节）演奏轮廓。
+ * 双指针扫描合并后的片段：逐段取较近的终点切出状态恒定区间，
+ * 首个状态不一致的区间即最早差异。
+ * 调用前提：两侧小节时值均等于拍号（覆盖同一总时长）。
+ */
+export function compareOutlines(score: Segment[], reference: Segment[]): OutlineComparison {
+  const a = mergeSegments(score);
+  const b = mergeSegments(reference);
+
+  let i = 0;
+  let j = 0;
+  let pos = Frac.zero();
+  while (i < a.length && j < b.length) {
+    const sa = a[i];
+    const sb = b[j];
+    const next = sa.end.cmp(sb.end) <= 0 ? sa.end : sb.end;
+    if (sa.sounding !== sb.sounding) {
+      return {
+        kind: 'diff',
+        diff: {
+          start: pos,
+          end: next,
+          scoreState: sa.sounding ? 'sounding' : 'silent',
+          referenceState: sb.sounding ? 'sounding' : 'silent',
+          scorePath: pathAt(score, pos),
+          referencePath: pathAt(reference, pos),
+        },
+      };
+    }
+    if (sa.end.cmp(next) === 0) i++;
+    if (sb.end.cmp(next) === 0) j++;
+    pos = next;
+  }
+  return { kind: 'match' };
+}
+
+/* ---------- 整谱分析 ---------- */
+
+export interface ScoreReport {
+  /** 记谱（measures）逐小节时值报告 */
+  measures: MeasureReport[];
+  /** 参考演奏（referenceMeasures）逐小节时值报告；未提供参考时为 null */
+  reference: MeasureReport[] | null;
+  /**
+   * 逐小节演奏轮廓对照；未提供参考时为 null。
+   * 任一侧时值非 ok 的小节为 null（仅显示时值问题，不做对照）。
+   */
+  comparisons: (OutlineComparison | null)[] | null;
+}
+
+/** 逐小节分析（含可选的参考演奏对照）。调用前须保证 validateScore 无错误。 */
+export function analyze(score: ScoreInput): ScoreReport {
+  const expected = Frac.of(score.timeSignature.numerator, score.timeSignature.denominator);
+
+  const measures = analyzeMeasures(score.measures, expected, 'measures');
+
+  const refMeasures = score.referenceMeasures;
+  const reference = refMeasures ? analyzeMeasures(refMeasures, expected, 'referenceMeasures') : null;
+
+  const comparisons =
+    reference && refMeasures
+      ? measures.map((m, i) => {
+          if (m.status !== 'ok' || reference[i].status !== 'ok') return null;
+          return compareOutlines(
+            expandMeasure(score.measures[i].events, `measures[${i}].events`),
+            expandMeasure(refMeasures[i].events, `referenceMeasures[${i}].events`),
+          );
+        })
+      : null;
+
+  return { measures, reference, comparisons };
 }
